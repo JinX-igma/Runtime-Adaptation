@@ -9,17 +9,13 @@ At this stage, the workflow consists of two steps.
 
 Run the following command inside the project directory:
 
----
-docker build -t wesad .
----
+`docker build -t wesad .`
 
 This creates the base environment with Python, PyTorch, and required dependencies.
 
 ### 2. Start the container
 
----
-./run_wesad.sh
----
+`./run_wesad.sh`
 
 The script launches an interactive Docker container and mounts:
 
@@ -32,8 +28,6 @@ This allows source code to be edited on the host while logs persist outside the 
 
 Once inside the Docker environment, you may execute any module inside `src/`, for example:
 
----
-python3 -m src.samplecode
----
+`python3 -m src.samplecode`
 
 This completes the initial setup required to begin development within the project’s Docker environment.
