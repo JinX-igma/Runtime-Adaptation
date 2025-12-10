@@ -221,3 +221,5 @@ __pycache__/
 
 # macOS metadata files
 .DS_Store
+
+.Rhistory
