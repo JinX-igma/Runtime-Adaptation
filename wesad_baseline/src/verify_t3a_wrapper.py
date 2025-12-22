@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from models.cnn_baseline import CNNBaseline
 from data.wesad_dataset import WESADDataset
-from t3a_wrapper import T3AWrapper
+from t3a_wrapper_v2 import T3AWrapper
 
 
 @torch.no_grad()
@@ -51,14 +51,27 @@ def run_verify(
     )
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
+    # t3a = T3AWrapper(
+    #     head_linear=model.head,
+    #     num_classes=3,
+    #     M=M,
+    #     ent_threshold=ent_th,
+    #     warmup_steps=warmup,
+    #     device=device,
+    # ).to(device)
     t3a = T3AWrapper(
         head_linear=model.head,
         num_classes=3,
-        M=M,
-        ent_threshold=ent_th,
-        warmup_steps=warmup,
+        M=t3a_params["M"],
+        warmup_steps=t3a_params.get("warmup_steps", 0),
         device=device,
+        ent_quantile=t3a_params.get("ent_quantile", 0.2),
+        ent_threshold=t3a_params.get("ent_threshold", None),
+        tau=t3a_params.get("tau", 1.0),
+        use_head_bias=t3a_params.get("use_head_bias", True),
+        keep_weight_anchor=t3a_params.get("keep_weight_anchor", True),
     ).to(device)
+ 
 
     rows = []
     changed_count = 0
