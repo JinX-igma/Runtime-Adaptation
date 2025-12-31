@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple
 from pathlib import Path
 
 from data.wesad_dataset import WESADDataset
-from data.stream_builder import build_subject_blocks  # 你把函数放到这个文件名里即可
+from data.stream_builder import build_subject_blocks  
 
 
 def safe_div(a: float, b: float) -> float:
@@ -285,7 +285,6 @@ def main():
 
     subjects = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17]
 
-    # 你要验证 A 时用的参数，尽量和你实际实验一致
     window_size = 700
     step_size = 350
     block_size = 50
