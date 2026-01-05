@@ -139,8 +139,8 @@ def verify_subject_A(
     stats_eval = summarize_labels(dataset, list(set_eval), num_classes)
 
     # 纯度检查
-    # 注意：你的 build_subject_blocks 是按固定 block_size 切 block，再按 major_label 分配
-    # 这里我们重新按原始 block 划分去计算纯度，以验证 major_label 的合理性
+    # 注意：build_subject_blocks 是按固定 block_size 切 block，再按 major_label 分配
+    # 这里重新按原始 block 划分去计算纯度，以验证 major_label 的合理性
     num_blocks = (n + block_size - 1) // block_size
     purities = []
     low_purity_blocks = 0
