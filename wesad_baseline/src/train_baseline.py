@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Fresh baseline training + evaluation for WESAD with fixed CNNBaseline.
+"""\
+WESAD 基线训练与评估（固定五人最终测试集，训练池内可选小折数交叉验证）。
 
-特性:
-- 使用既定 CNNBaseline 结构 (in_channels=8, num_classes=3)
-- 全新训练 (随机初始化, 不加载旧权重)
-- Subject 划分清晰:
-  TRAIN_SUBJECTS / VAL_SUBJECTS / AE_SUBJECTS / HELDOUT_TEST_SUBJECTS
-- 训练完后, 在 seen vs unseen subject 上分别评估并写入 log.
+目标
+1 留出 5 个受试者作为最终部署测试集，从头到尾不参与训练和任何选择。
+2 剩余受试者作为训练池，用于训练群体 baseline。
+3 在训练池内可选 2 折或 3 折交叉验证，仅用于验证训练流程稳定性，不用于调参。
+4 每个窗口大小只训练 1 个 baseline checkpoint，然后在最终测试集上评估。
 
-用法 (在 Docker 内):
-  python3 train_baseline_fresh.py \
-    --data-root /workspace/data/WESAD \
-    --batch-size 32 \
-    --epochs 40 \
-    --device cpu
-
-用法 (在 TX2 上也可以, 如果只是想重训):
-  python3 train_baseline_fresh.py \
-    --data-root /media/tx2/Base/WESAD \
-    --device cuda
+说明
+step_size 固定为 window_size 的一半，对应 50% overlap，不允许手动指定。
 """
 
 import argparse
@@ -31,41 +21,47 @@ from datetime import datetime
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler 
+from torch.utils.data import DataLoader  # sampler referenced via torch.utils.data
 
 
 from data.wesad_dataset import WESADDataset
 from models.cnn_baseline import CNNBaseline
 
 
+
 # ============================================================
-# 全局 subject 划分
+# 受试者列表
 # ============================================================
 ALL_SUBJECTS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17]
 
-# 1) 训练集 (参与梯度更新)
-TRAIN_SUBJECTS = [3, 4, 5, 6, 7, 8, 10, 11]
+# 默认最终测试集，5 人
+# 你可以通过命令行参数覆盖
+DEFAULT_FINAL_TEST_SUBJECTS = [13, 14, 15, 16, 17]
 
-# 2) 验证集 (early stopping / epoch 选择)
-VAL_SUBJECTS = [13, 14]
+# ============================================================
+# 窗口元信息（用于日志与论文复现）
+# ============================================================
+FS_HZ = 700  # WESAD 胸部信号采样率
 
-# 3) 自适应实验专用 (不用于 baseline 训练)
-AE_SUBJECTS = [2, 9, 17]
+def window_meta(window_size: int, step_size: int, fs_hz: int = FS_HZ):
+    """返回 window_sec step_sec overlap_ratio 便于日志记录。"""
+    w_sec = float(window_size) / float(fs_hz)
+    s_sec = float(step_size) / float(fs_hz)
+    overlap = 1.0 - (float(step_size) / float(window_size))
+    return w_sec, s_sec, overlap
 
-# 4) 最终外部评估专用 (不用于训练 / 自适应)
-HELDOUT_TEST_SUBJECTS = [15, 16]
+def choose_val_subjects(train_pool, preferred=(13, 14), k: int = 2):
+    """从当前训练池中选择验证受试者。
 
-def compute_label_stats(dataset, num_classes=3):
+    优先选择 preferred 中的 ID，如不足则补充最小的 ID。
+    保证 LOSO 完全受试者不重叠。
     """
-    统计数据集中每个标签的数量和比例
-    依赖 dataset.labels 为一维标签数组
-    返回 (counts, ratios)
-    """
-    labels = np.array(dataset.labels)
-    counts = np.array([np.sum(labels == c) for c in range(num_classes)], dtype=int)
-    total = counts.sum() if counts.sum() > 0 else 1
-    ratios = counts.astype(float) / float(total)
-    return counts, ratios
+    pool = [int(s) for s in train_pool]
+    val = [s for s in preferred if s in pool]
+    if len(val) < k:
+        remain = [s for s in sorted(pool) if s not in val]
+        val += remain[: max(0, k - len(val))]
+    return val[:k]
 
 # ============================================================
 # 工具函数: 随机种子, 日志, exp_id
@@ -80,9 +76,21 @@ def set_seed(seed: int = 42):
         torch.cuda.manual_seed_all(seed)
 
 
-def create_experiment_id(prefix: str = "baseline_fresh") -> str:
+def create_experiment_id(prefix: str = "baseline", window_size: int = None, kfold: int = None) -> str:
+    """生成实验编号。
+
+    目标是让文件名一眼可读，至少包含时间戳与关键配置。
+    window_size 以样本数记录，例如 W700。
+    kfold 记录为 K0 K2 K3。
+    """
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"exp_{now}_{prefix}"
+    parts = ["exp", now]
+    if window_size is not None:
+        parts.append(f"W{int(window_size)}")
+    if kfold is not None:
+        parts.append(f"K{int(kfold)}")
+    parts.append(prefix)
+    return "_".join(parts)
 
 
 def create_logger(exp_id: str, log_dir: str = None):
@@ -162,6 +170,11 @@ def build_dataset_for_subjects(
     num_classes: int = 3,
     normalize: bool = True,
 ):
+    # 归一化说明（复现关键点）
+    # 如果 WESADDataset 使用传入的 subject_ids 计算 mean std
+    # 那么在评估阶段对每个测试受试者单独 normalize=True 等价于使用目标受试者统计量
+    # 这不是标签泄漏，但会改变跨受试者设定
+    # 更严格的做法是仅用训练受试者统计量，并在所有划分中复用（需要数据集支持传入预先计算的统计量）
     dataset = WESADDataset(
         root=data_root,
         subject_ids=subject_ids,
@@ -203,13 +216,14 @@ def evaluate_model(model, loader, device, num_classes=3):
 
 def evaluate_group(model, data_root, subject_ids, window_size, step_size, device, batch_size, num_classes=3):
     """
-    对一组 subject 逐个评估, 返回列表:
+    对一组受试者逐个评估，返回列表:
     [(sid, loss, acc, n_samples, conf_mat), ...]
     """
     results = []
     for sid in subject_ids:
         subj_str = f"S{sid}"
-        print(f"  [Eval] Subject {subj_str} ...")
+        print(f"  [评估] 受试者 {subj_str} ...")
+        # 当前评估阶段使用 normalize=True，归一化说明见 build_dataset_for_subjects。
         dataset = build_dataset_for_subjects(
             data_root=data_root,
             subject_ids=[sid],
@@ -234,34 +248,53 @@ def evaluate_group(model, data_root, subject_ids, window_size, step_size, device
 
 def summarize_group(name: str, results, f=None):
     if not results:
-        log(f, f"[WARN] No results for group {name}")
+        log(f, f"[警告] 分组 {name} 没有结果")
         return
     sids = [r[0] for r in results]
     losses = np.array([r[1] for r in results], dtype=float)
     accs = np.array([r[2] for r in results], dtype=float)
     ns = np.array([r[3] for r in results], dtype=int)
 
-    # 聚合所有 subject 的混淆矩阵以统计每個 class 的識別情況
     num_classes = 3
     conf_sum = np.zeros((num_classes, num_classes), dtype=int)
     for r in results:
         conf_sum += r[4]
 
     log(f, "--------------------------------------------------")
-    log(f, f"Summary for group: {name}")
-    log(f, f"  subjects: {sids}")
-    log(f, f"  mean loss: {losses.mean():.4f} (std {losses.std():.4f})")
-    log(f, f"  mean acc : {accs.mean():.4f} (std {accs.std():.4f})")
+    log(f, f"分组总结: {name}")
+    log(f, f"  受试者: {sids}")
+    log(f, f"  平均损失: {losses.mean():.4f} (std {losses.std():.4f})")
+    log(f, f"  平均准确率: {accs.mean():.4f} (std {accs.std():.4f})")
     acc_weighted = (accs * ns / ns.sum()).sum()
-    log(f, f"  weighted acc by #samples: {acc_weighted:.4f}")
-    # 每個 class 的召回率 (正確識別該類別的比例)
-    per_class_recall = []
+    log(f, f"  按样本加权准确率: {acc_weighted:.4f}")
+    # 每类召回率，两种聚合方式
+    # 方式一 按样本加权 先累加混淆矩阵再计算
+    per_class_recall_weighted = []
     for c in range(num_classes):
         true_c = conf_sum[c, c]
         total_c = conf_sum[c, :].sum()
         recall_c = float(true_c) / float(total_c) if total_c > 0 else 0.0
-        per_class_recall.append(round(recall_c, 4))
-    log(f, f"  per-class recall [class0,class1,class2]: {per_class_recall}")
+        per_class_recall_weighted.append(recall_c)
+
+    # 方式二 按受试者统计 先算每个受试者再做汇总
+    subj_recalls = []
+    for (sid, _loss, _acc, _n, cm) in results:
+        r_list = []
+        for c in range(num_classes):
+            denom = cm[c, :].sum()
+            r_list.append(float(cm[c, c]) / float(denom) if denom > 0 else 0.0)
+        subj_recalls.append(r_list)
+
+    subj_recalls = np.array(subj_recalls, dtype=float) if len(subj_recalls) > 0 else np.zeros((0, num_classes))
+
+    log(f, f"  每类召回率（样本加权）: {[round(x, 4) for x in per_class_recall_weighted]}")
+    if subj_recalls.shape[0] > 0:
+        mean_subj = subj_recalls.mean(axis=0)
+        med_subj = np.median(subj_recalls, axis=0)
+        p10_subj = np.percentile(subj_recalls, 10, axis=0)
+        log(f, f"  每类召回率（受试者均值）  : {[round(x, 4) for x in mean_subj]}")
+        log(f, f"  每类召回率（受试者中位数）: {[round(x, 4) for x in med_subj]}")
+        log(f, f"  每类召回率（受试者10分位）: {[round(x, 4) for x in p10_subj]}")
 
 
 # ============================================================
@@ -269,7 +302,7 @@ def summarize_group(name: str, results, f=None):
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Fresh baseline training (CNNBaseline) with clear seen/unseen subject split"
+        description="WESAD 基线训练与评估"
     )
     parser.add_argument(
         "--data-root",
@@ -308,10 +341,17 @@ def main():
         help="滑窗大小 (与之前保持一致)",
     )
     parser.add_argument(
-        "--step-size",
+        "--final-test-subjects",
+        type=str,
+        default=",".join([str(x) for x in DEFAULT_FINAL_TEST_SUBJECTS]),
+        help="最终测试集受试者 ID，逗号分隔，例如 13,14,15,16,17。该集合从头到尾不参与训练。",
+    )
+    parser.add_argument(
+        "--kfold",
         type=int,
-        default=350,
-        help="滑窗步长 (与之前保持一致)",
+        default=2,
+        choices=[0, 2, 3],
+        help="训练池内交叉验证折数。0 表示不做。2 或 3 仅用于稳定性检查，不用于调参。",
     )
     parser.add_argument(
         "--device",
@@ -328,6 +368,14 @@ def main():
     )
     args = parser.parse_args()
 
+    def parse_subject_list(s: str):
+        items = []
+        for part in s.split(","):
+            part = part.strip()
+            if part:
+                items.append(int(part))
+        return items
+
     set_seed(7)
 
     if args.device == "cuda" and torch.cuda.is_available():
@@ -341,321 +389,284 @@ def main():
     lr = args.lr
     weight_decay = args.weight_decay
     window_size = args.window_size
-    step_size = args.step_size
 
-    # 生成实验 id & logger
-    exp_id = create_experiment_id("baseline_fresh")
+    # step_size 和 overlap 由 window_size 决定，保持 50% 重叠
+    # 这样可以避免不同实验之间由于推理频率不同造成不可比
+    if window_size % 2 != 0:
+        raise ValueError(f"window_size 必须为偶数以保证 50% 重叠, 当前 window_size={window_size}")
+    step_size = window_size // 2
+
+    w_sec, s_sec, ov = window_meta(window_size, step_size)
+
+    # exp_id 写入窗口大小与 kfold 配置，便于定位日志与 checkpoint
+    exp_id = create_experiment_id("baseline", window_size=window_size, kfold=args.kfold)
     f, log_path = create_logger(exp_id)
 
     # checkpoint 目录
     ckpt_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
-    ckpt_path = os.path.join(ckpt_dir, f"{exp_id}_baseline_cnn.pt")
 
-    log(f, "========== Fresh Baseline Training ==========")
-    log(f, f"Experiment id : {exp_id}")
-    log(f, f"Log path      : {log_path}")
-    log(f, f"Checkpoint    : {ckpt_path}")
-    log(f, "")
-    log(f, "Subject split:")
-    log(f, f"  TRAIN_SUBJECTS          : {TRAIN_SUBJECTS}")
-    log(f, f"  VAL_SUBJECTS            : {VAL_SUBJECTS}")
-    log(f, f"  AE_SUBJECTS (for adapt) : {AE_SUBJECTS}")
-    log(f, f"  HELDOUT_TEST_SUBJECTS   : {HELDOUT_TEST_SUBJECTS}")
-    log(f, "")
-
-    # 构建原始訓練集與驗證集
-    train_dataset = build_dataset_for_subjects(
-        data_root=data_root,
-        subject_ids=TRAIN_SUBJECTS,
-        window_size=window_size,
-        step_size=step_size,
-        num_classes=3,
-        normalize=True,
-    )
-    val_dataset = build_dataset_for_subjects(
-        data_root=data_root,
-        subject_ids=VAL_SUBJECTS,
-        window_size=window_size,
-        step_size=step_size,
-        num_classes=3,
-        normalize=True,
-    )
-
-    # 先統計原始標籤分佈
-    train_labels = np.array(train_dataset.labels, dtype=int)
-    val_labels = np.array(val_dataset.labels, dtype=int)
-
-    num_classes = 3
-    train_counts = np.array(
-        [(train_labels == c).sum() for c in range(num_classes)], dtype=int
-    )
-    train_ratios = train_counts / train_counts.sum()
-
-    val_counts = np.array(
-        [(val_labels == c).sum() for c in range(num_classes)], dtype=int
-    )
-    val_ratios = val_counts / val_counts.sum()
-
-    log(f, "Dataset information")
-    log(f, f"  Data root   : {data_root}")
-    log(f, f"  Window size : {window_size}")
-    log(f, f"  Step size   : {step_size}")
-    log(f, f"  Train samples: {len(train_dataset)}")
-    log(f, f"  Val samples  : {len(val_dataset)}")
-    log(f, "")
-    log(f, "Label distribution in TRAIN dataset (before sampling)")
-    log(f, f"  counts per class [0,1,2]: {train_counts.tolist()}")
-    log(f, f"  ratios per class [0,1,2]: {[round(r, 4) for r in train_ratios]}")
-    log(f, "")
-    log(f, "Label distribution in VAL dataset")
-    log(f, f"  counts per class [0,1,2]: {val_counts.tolist()}")
-    log(f, f"  ratios per class [0,1,2]: {[round(r, 4) for r in val_ratios]}")
+    log(f, "========== 基线训练与评估 ==========")
+    log(f, f"实验编号         : {exp_id}")
+    log(f, f"日志路径         : {log_path}")
+    log(f, "命名规则         : exp_时间_W窗口样本_K折数_baseline")
+    log(f, f"设备             : {device}")
+    log(f, f"数据根目录       : {data_root}")
+    log(f, f"采样率           : {FS_HZ} Hz")
+    log(f, f"窗口大小         : {window_size}")
+    log(f, f"步长             : {step_size} (由 window_size 计算)")
+    log(f, f"窗口秒数         : {w_sec:.3f}")
+    log(f, f"步长秒数         : {s_sec:.3f} (由 window_size 计算)")
+    log(f, f"重叠率           : {ov:.3f} ({ov*100:.1f}%)")
+    log(f, f"最大训练轮数     : {num_epochs}")
+    log(f, f"Batch size       : {batch_size}")
+    log(f, f"学习率           : {lr}")
+    log(f, f"权重衰减         : {weight_decay}")
+    log(f, f"EarlyStop patience: {args.patience}")
     log(f, "")
 
-    # 構建類別均衡的 WeightedRandomSampler
-    # 每個類別的權重與其出現次數的倒數成正比
-    class_weights = 1.0 / train_counts.astype(np.float64)
-    sample_weights = class_weights[train_labels]  # 每一個樣本的權重
+    log(f, "开始执行固定五人最终测试集协议 ...")
 
-    log(f, "Class weights used for balanced sampling")
-    log(f, f"  class_weights [0,1,2]: {[float(w) for w in class_weights]}")
+    # 最终测试集与训练池
+    final_test_subjects = parse_subject_list(args.final_test_subjects)
+    final_test_subjects = [s for s in final_test_subjects if s in ALL_SUBJECTS]
+    final_test_subjects = sorted(list(dict.fromkeys(final_test_subjects)))
+
+    if len(final_test_subjects) != 5:
+        raise ValueError(f"final_test_subjects 必须包含 5 个受试者，当前为 {final_test_subjects}")
+
+    train_pool_subjects = [s for s in ALL_SUBJECTS if s not in final_test_subjects]
+    if len(train_pool_subjects) == 0:
+        raise ValueError("训练池为空，请检查 final_test_subjects")
+
+    log(f, "训练与评估协议")
+    log(f, f"  最终测试集(5人) : {final_test_subjects}")
+    log(f, f"  训练池(其余人)  : {train_pool_subjects}")
+    log(f, f"  训练池 kfold    : {args.kfold}")
     log(f, "")
 
-    sampler = torch.utils.data.WeightedRandomSampler(
-        weights=torch.from_numpy(sample_weights.astype(np.float32)),
-        num_samples=len(sample_weights),
-        replacement=True,
-    )
+    def train_one_model(train_subjects, val_subjects, ckpt_path, use_early_stop: bool):
+        """训练一个模型。
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        sampler=sampler,   # 使用類別均衡采樣
-        shuffle=False,     # 有 sampler 時不能再 shuffle
-        num_workers=0,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-    )
-
-    # 額外做一個 epoch 的采樣分佈檢查 用於 log 中明確證明近似 1 比 1 比 1
-    inspect_counts = np.zeros(num_classes, dtype=int)
-    for _, y_batch in train_loader:
-        y_np = y_batch.numpy()
-        for c in range(num_classes):
-            inspect_counts[c] += (y_np == c).sum()
-    inspect_ratios = inspect_counts / inspect_counts.sum()
-
-    log(f, "Label distribution in one TRAIN epoch (after balanced sampling)")
-    log(f, f"  counts per class [0,1,2]: {inspect_counts.tolist()}")
-    log(f, f"  ratios per class [0,1,2]: {[round(r, 4) for r in inspect_ratios]}")
-    log(f, "")
-
-    # DataLoader
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        sampler=sampler,      # 使用均衡采样
-        shuffle=False,        # sampler 已经负责随机抽样 这里必须为 False
-        num_workers=0,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,        # 验证集保持顺序评估
-        num_workers=0,
-    )
-
-    # 模型 & 优化器
-    in_channels = 8
-    num_classes = 3
-
-    model = CNNBaseline(in_channels=in_channels, num_classes=num_classes)
-    model.to(device)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    log(f, "Model information")
-    log(f, f"  Python version : {platform.python_version()}")
-    log(f, f"  PyTorch version: {torch.__version__}")
-    log(f, f"  Device         : {device}")
-    log(f, f"  Total params   : {total_params}")
-    log(f, "")
-
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-
-    log(f, "Training configuration")
-    log(f, f"  Batch size   : {batch_size}")
-    log(f, f"  Epochs (max) : {num_epochs}")
-    log(f, f"  LR           : {lr}")
-    log(f, f"  Weight decay : {weight_decay}")
-    log(f, f"  EarlyStop patience: {args.patience}")
-    log(f, "")
-
-    config = {
-        "exp_id": exp_id,
-        "data_root": data_root,
-        "batch_size": batch_size,
-        "epochs": num_epochs,
-        "lr": lr,
-        "weight_decay": weight_decay,
-        "window_size": window_size,
-        "step_size": step_size,
-        "device": str(device),
-        "patience": args.patience,
-        "train_subjects": TRAIN_SUBJECTS,
-        "val_subjects": VAL_SUBJECTS,
-        "ae_subjects": AE_SUBJECTS,
-        "heldout_test_subjects": HELDOUT_TEST_SUBJECTS,
-    }
-
-    # Early stopping based on val_acc
-    early_stopper = EarlyStopping(patience=args.patience, mode="max", min_delta=0.0)
-    best_val_acc = 0.0
-    best_epoch = 0
-
-    start_time = time.time()
-    log(f, "Start training...")
-
-    for epoch in range(1, num_epochs + 1):
-        model.train()
-        total_loss = 0.0
-        total_correct = 0
-        total_samples = 0
-
-        for x, y in train_loader:
-            x = x.to(device)
-            y = y.to(device)
-
-            optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item() * x.size(0)
-            preds = torch.argmax(logits, dim=1)
-            total_correct += (preds == y).sum().item()
-            total_samples += x.size(0)
-
-        train_loss = total_loss / total_samples
-        train_acc = total_correct / total_samples
-
-        val_loss, val_acc, val_samples, _ = evaluate_model(model, val_loader, device, num_classes=num_classes)
-
-        log(
-            f,
-            "Epoch {:03d}  Train loss (train subjects) {:.4f}  Train acc (train subjects) {:.4f}  Val loss (unseen subjects) {:.4f}  Val acc (unseen subjects) {:.4f}".format(
-                epoch, train_loss, train_acc, val_loss, val_acc
-            ),
+        use_early_stop=True 时，每个 epoch 计算 val_acc 并基于 val_acc 保存最佳 checkpoint。
+        use_early_stop=False 时，不进行验证选择，训练满 epochs 后保存最终 checkpoint。
+        """
+        train_dataset = build_dataset_for_subjects(
+            data_root=data_root,
+            subject_ids=train_subjects,
+            window_size=window_size,
+            step_size=step_size,
+            num_classes=3,
+            normalize=True,
         )
 
-        # 保存 best checkpoint
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_epoch = epoch
+        if val_subjects is not None and len(val_subjects) > 0:
+            val_dataset = build_dataset_for_subjects(
+                data_root=data_root,
+                subject_ids=val_subjects,
+                window_size=window_size,
+                step_size=step_size,
+                num_classes=3,
+                normalize=True,
+            )
+        else:
+            val_dataset = None
+
+        train_labels = np.array(train_dataset.labels, dtype=int)
+        train_counts = np.array([(train_labels == c).sum() for c in range(3)], dtype=int)
+        log(f, f"  训练样本数: {len(train_dataset)}  各类计数 {train_counts.tolist()}")
+
+        if val_dataset is not None:
+            val_labels = np.array(val_dataset.labels, dtype=int)
+            val_counts = np.array([(val_labels == c).sum() for c in range(3)], dtype=int)
+            log(f, f"  验证样本数: {len(val_dataset)}  各类计数 {val_counts.tolist()}")
+
+        # 类别均衡采样权重，防止为0
+        eps = 1e-12
+        safe_counts = np.maximum(train_counts.astype(np.float64), eps)
+        class_weights = 1.0 / safe_counts
+        sample_weights = class_weights[train_labels]
+
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=torch.from_numpy(sample_weights.astype(np.float32)),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            shuffle=False,
+            num_workers=0,
+        )
+
+        if val_dataset is not None:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=0,
+            )
+        else:
+            val_loader = None
+
+        model = CNNBaseline(in_channels=8, num_classes=3)
+        model.to(device)
+
+        criterion = torch.nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        best_val_acc = -1.0
+        best_epoch = 0
+        early_stopper = EarlyStopping(patience=args.patience, mode="max", min_delta=0.0) if use_early_stop else None
+
+        log(f, "  开始训练 ...")
+        for epoch in range(1, num_epochs + 1):
+            model.train()
+            total_loss = 0.0
+            total_correct = 0
+            total_samples = 0
+
+            for x, y in train_loader:
+                x = x.to(device)
+                y = y.to(device)
+                optimizer.zero_grad()
+                logits = model(x)
+                loss = criterion(logits, y)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item() * x.size(0)
+                preds = torch.argmax(logits, dim=1)
+                total_correct += (preds == y).sum().item()
+                total_samples += x.size(0)
+
+            train_loss = total_loss / total_samples
+            train_acc = total_correct / total_samples
+
+            if val_loader is not None:
+                val_loss, val_acc, _val_samples, _ = evaluate_model(model, val_loader, device, num_classes=3)
+                log(f, f"  Epoch {epoch:03d}  train_loss {train_loss:.4f}  train_acc {train_acc:.4f}  val_loss {val_loss:.4f}  val_acc {val_acc:.4f}")
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_epoch = epoch
+                    ckpt = {
+                        "exp_id": exp_id,
+                        "epoch": epoch,
+                        "best_val_acc": float(best_val_acc),
+                        "model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "window_size": window_size,
+                        "step_size": step_size,
+                        "fs_hz": FS_HZ,
+                        "window_sec": w_sec,
+                        "step_sec": s_sec,
+                        "overlap": ov,
+                        "train_subjects": list(train_subjects),
+                        "val_subjects": list(val_subjects) if val_subjects is not None else [],
+                        "final_test_subjects": list(final_test_subjects),
+                        "seed": 7,
+                        "lr": lr,
+                        "weight_decay": weight_decay,
+                        "batch_size": batch_size,
+                        "epochs": num_epochs,
+                        "patience": args.patience,
+                    }
+                    torch.save(ckpt, ckpt_path)
+                    log(f, f"  新最佳 checkpoint 已保存 epoch {epoch:03d}")
+
+                if early_stopper is not None and early_stopper(val_acc):
+                    log(f, f"  Early stopping 触发于 epoch {epoch}")
+                    break
+            else:
+                log(f, f"  Epoch {epoch:03d}  train_loss {train_loss:.4f}  train_acc {train_acc:.4f}")
+
+        # 无验证选择时，保存最终 checkpoint
+        if val_loader is None:
             ckpt = {
                 "exp_id": exp_id,
-                "epoch": epoch,
-                "best_val_acc": best_val_acc,
+                "epoch": num_epochs,
+                "best_val_acc": None,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "config": config,
+                "window_size": window_size,
+                "step_size": step_size,
+                "fs_hz": FS_HZ,
+                "window_sec": w_sec,
+                "step_sec": s_sec,
+                "overlap": ov,
+                "train_subjects": list(train_subjects),
+                "val_subjects": [],
+                "final_test_subjects": list(final_test_subjects),
+                "seed": 7,
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "batch_size": batch_size,
+                "epochs": num_epochs,
+                "patience": args.patience,
             }
             torch.save(ckpt, ckpt_path)
-            log(
-                f,
-                "  New best model saved at epoch {:03d}  val_acc {:.4f}".format(
-                    epoch, val_acc
-                ),
-            )
+            log(f, f"  最终 checkpoint 已保存 epoch {num_epochs:03d}")
+        else:
+            log(f, f"  本次训练最佳 epoch {best_epoch}  best val_acc {best_val_acc:.4f}")
 
-        # early stopping 检查
-        if early_stopper(val_acc):
-            log(f, f"  Early stopping triggered at epoch {epoch}")
-            break
+        return ckpt_path
 
-    elapsed = time.time() - start_time
+    # 训练池内 kfold 仅用于流程稳定性检查，不用于调参
+    if args.kfold > 0:
+        k = args.kfold
+        log(f, "训练池内交叉验证（稳定性检查）")
+        log(f, f"  折数 k = {k}")
+        pool = sorted(list(train_pool_subjects))
+        folds = [[] for _ in range(k)]
+        for idx, sid in enumerate(pool):
+            folds[idx % k].append(sid)
+
+        for i in range(k):
+            val_subjects = folds[i]
+            train_subjects = [s for j in range(k) if j != i for s in folds[j]]
+            log(f, "")
+            log(f, f"  kfold 第 {i+1} 折")
+            log(f, f"    训练受试者: {train_subjects}")
+            log(f, f"    验证受试者: {val_subjects}")
+
+            # kfold 临时 checkpoint 文件名包含折序号，方便排查
+            ckpt_tmp = os.path.join(ckpt_dir, f"{exp_id}_kfold_fold{i+1}_tmp.pt")
+            train_one_model(train_subjects, val_subjects, ckpt_tmp, use_early_stop=True)
+
+        log(f, "")
+        log(f, "训练池内交叉验证完成，仅用于稳定性确认")
+        log(f, "")
+
+    # 最终训练，每个窗口大小只训练一个 baseline checkpoint
+    log(f, "开始最终训练（使用训练池全部受试者）")
+    final_ckpt_path = os.path.join(ckpt_dir, f"{exp_id}_final_baseline_cnn.pt")
+    train_one_model(train_pool_subjects, val_subjects=None, ckpt_path=final_ckpt_path, use_early_stop=False)
+
+    # 在最终测试集上评估
     log(f, "")
-    log(f, "========== Training Finished ==========")
-    log(f, f"  Best epoch   : {best_epoch}")
-    log(f, f"  Best val_acc : {best_val_acc:.4f}")
-    log(f, f"  Total time   : {elapsed:.1f} sec")
-    log(f, f"  Final ckpt   : {ckpt_path}")
-    log(f, "")
-
-    # ========================================================
-    # 使用 best checkpoint 在 seen / unseen 上做完整评估
-    # ========================================================
-    log(f, "========== Final Evaluation on seen vs unseen sets ==========")
-    # 重新加载 best 权重
-    state = torch.load(ckpt_path, map_location="cpu")
+    log(f, "开始在最终测试集上评估")
+    state = torch.load(final_ckpt_path, map_location="cpu")
+    model = CNNBaseline(in_channels=8, num_classes=3)
     model.load_state_dict(state["model_state"])
-    # 如有需要, 可以在這裡讀取 state["config"] 進行一致性檢查
     model.to(device)
 
-    # 1) TRAIN_SUBJECTS
-    log(f, "Evaluate TRAIN_SUBJECTS (seen-train)")
-    results_train = evaluate_group(
+    results_final_test = evaluate_group(
         model=model,
         data_root=data_root,
-        subject_ids=TRAIN_SUBJECTS,
+        subject_ids=final_test_subjects,
         window_size=window_size,
         step_size=step_size,
         device=device,
         batch_size=batch_size,
+        num_classes=3,
     )
-    summarize_group("Train-Subjects (unseen windows)", results_train, f=f)
-
-    # 2) VAL_SUBJECTS
-    log(f, "Evaluate VAL_SUBJECTS (seen-val)")
-    results_val = evaluate_group(
-        model=model,
-        data_root=data_root,
-        subject_ids=VAL_SUBJECTS,
-        window_size=window_size,
-        step_size=step_size,
-        device=device,
-        batch_size=batch_size,
-    )
-    summarize_group("Val-Subjects (subject-wise validation)", results_val, f=f)
-
-    # 3) AE_SUBJECTS
-    log(f, "Evaluate AE_SUBJECTS (unseen-for-adapt)")
-    results_ae = evaluate_group(
-        model=model,
-        data_root=data_root,
-        subject_ids=AE_SUBJECTS,
-        window_size=window_size,
-        step_size=step_size,
-        device=device,
-        batch_size=batch_size,
-    )
-    summarize_group("Adapt-Subjects (unseen for training)", results_ae, f=f)
-
-    # 4) HELDOUT_TEST_SUBJECTS
-    log(f, "Evaluate HELDOUT_TEST_SUBJECTS (final-unseen-test)")
-    results_test = evaluate_group(
-        model=model,
-        data_root=data_root,
-        subject_ids=HELDOUT_TEST_SUBJECTS,
-        window_size=window_size,
-        step_size=step_size,
-        device=device,
-        batch_size=batch_size,
-    )
-    summarize_group("Held-out Test Subjects (final evaluation)", results_test, f=f)
+    summarize_group("最终测试集评估", results_final_test, f=f)
 
     log(f, "")
-    log(f, "All done.")
+    log(f, "全部完成。")
     f.close()
 
 

@@ -25,13 +25,7 @@ def map_raw_label_to_3cls(raw_label: int) -> int:
       neutral:   0  (原始標籤 1 對應 neutral 段前 baseline 等視為無效, 這裡只保留標籤 1 對應 neutral)
       stress:    1  (原始標籤 2)
       amusement: 2  (原始標籤 3)
-
-    注意: 具體映射可以根據你之前 inspect_labels 的對應關係調整
-    這裡采用你當前代碼中使用的設置:
-      1 -> 0 (neutral)
-      2 -> 1 (stress)
-      3 -> 2 (amusement)
-      其他 -> -1 無效
+      其他標籤視為無效 -1
     """
     if raw_label == 1:
         return 0
