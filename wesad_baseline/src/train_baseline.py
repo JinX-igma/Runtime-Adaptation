@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """\
-WESAD 基线训练与评估（固定五人最终测试集，训练池内可选小折数交叉验证）。
+WESAD 基线训练（固定五人最终测试集，训练池内可选小折数交叉验证）。
 
 目标
 1 留出 5 个受试者作为最终部署测试集，从头到尾不参与训练和任何选择。
 2 剩余受试者作为训练池，用于训练群体 baseline。
 3 在训练池内可选 2 折或 3 折交叉验证，仅用于验证训练流程稳定性，不用于调参。
-4 每个窗口大小只训练 1 个 baseline checkpoint，然后在最终测试集上评估。
+4 每个窗口大小只训练 1 个 baseline checkpoint 并保存。最终测试在单独脚本中完成。
 
 说明
 step_size 固定为 window_size 的一半，对应 50% overlap，不允许手动指定。
@@ -32,7 +32,11 @@ from models.cnn_baseline import CNNBaseline
 # ============================================================
 # 受试者列表
 # ============================================================
+
 ALL_SUBJECTS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17]
+
+# 类别名称映射，固定为三分类 baseline stress amusement
+CLASS_NAMES = ["baseline", "stress", "amusement"]
 
 # 默认最终测试集，5 人
 # 你可以通过命令行参数覆盖
@@ -214,6 +218,35 @@ def evaluate_model(model, loader, device, num_classes=3):
     return avg_loss, acc, total_samples, conf_mat
 
 
+# 由混淆矩阵计算每类 precision recall f1 以及 macro_f1。
+# conf_mat 的定义为 true label 在行，pred label 在列。
+def metrics_from_confusion(conf_mat: np.ndarray):
+    """由混淆矩阵计算每类 precision recall f1 以及 macro_f1。
+
+    conf_mat 的定义为 true label 在行，pred label 在列。
+    """
+    num_classes = conf_mat.shape[0]
+    precision = []
+    recall = []
+    f1 = []
+
+    for c in range(num_classes):
+        tp = float(conf_mat[c, c])
+        fp = float(conf_mat[:, c].sum() - conf_mat[c, c])
+        fn = float(conf_mat[c, :].sum() - conf_mat[c, c])
+
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f = (2.0 * p * r / (p + r)) if (p + r) > 0 else 0.0
+
+        precision.append(p)
+        recall.append(r)
+        f1.append(f)
+
+    macro_f1 = float(np.mean(f1)) if len(f1) > 0 else 0.0
+    return precision, recall, f1, macro_f1
+
+
 def evaluate_group(model, data_root, subject_ids, window_size, step_size, device, batch_size, num_classes=3):
     """
     对一组受试者逐个评估，返回列表:
@@ -260,6 +293,9 @@ def summarize_group(name: str, results, f=None):
     for r in results:
         conf_sum += r[4]
 
+    # 由混淆矩阵计算分组层面的 precision recall f1
+    p_w, r_w, f1_w, macro_f1_w = metrics_from_confusion(conf_sum)
+
     log(f, "--------------------------------------------------")
     log(f, f"分组总结: {name}")
     log(f, f"  受试者: {sids}")
@@ -296,6 +332,25 @@ def summarize_group(name: str, results, f=None):
         log(f, f"  每类召回率（受试者中位数）: {[round(x, 4) for x in med_subj]}")
         log(f, f"  每类召回率（受试者10分位）: {[round(x, 4) for x in p10_subj]}")
 
+    # 说明
+    # 日志仅做简要汇总（准确率与每类召回率）。
+    # 更完整的逐受试者指标（precision recall f1 macro_f1 以及混淆矩阵）会写入 CSV 方便后续处理。
+    # 输出每类 precision 和 f1，便于论文中对比
+#    log(f, f"  每类精确率（样本加权）: {[round(x, 4) for x in p_w]}")
+#    log(f, f"  每类F1（样本加权）    : {[round(x, 4) for x in f1_w]}")
+#    log(f, f"  Macro F1（样本加权）  : {macro_f1_w:.4f}")
+#
+#    # 受试者层面的 macro F1 统计
+#    subj_macro_f1 = []
+#    for (_sid, _loss, _acc, _n, cm) in results:
+#        _p, _r, _f1, _mf1 = metrics_from_confusion(cm)
+#        subj_macro_f1.append(_mf1)
+#    subj_macro_f1 = np.array(subj_macro_f1, dtype=float) if len(subj_macro_f1) > 0 else np.zeros((0,))
+#    if subj_macro_f1.shape[0] > 0:
+#        log(f, f"  Macro F1（受试者均值）  : {float(subj_macro_f1.mean()):.4f}")
+#        log(f, f"  Macro F1（受试者中位数）: {float(np.median(subj_macro_f1)):.4f}")
+#        log(f, f"  Macro F1（受试者10分位）: {float(np.percentile(subj_macro_f1, 10)):.4f}")
+
 
 # ============================================================
 # 主训练流程
@@ -319,7 +374,7 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=40,
+        default=20,
         help="最大训练轮数 (early stopping 可能提前结束)",
     )
     parser.add_argument(
@@ -406,6 +461,10 @@ def main():
     ckpt_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    # kfold 稳定性检查的临时 checkpoint 单独放在 tmp 子目录，避免污染主目录
+    ckpt_tmp_dir = os.path.join(ckpt_dir, "tmp")
+    os.makedirs(ckpt_tmp_dir, exist_ok=True)
+
     log(f, "========== 基线训练与评估 ==========")
     log(f, f"实验编号         : {exp_id}")
     log(f, f"日志路径         : {log_path}")
@@ -418,6 +477,7 @@ def main():
     log(f, f"窗口秒数         : {w_sec:.3f}")
     log(f, f"步长秒数         : {s_sec:.3f} (由 window_size 计算)")
     log(f, f"重叠率           : {ov:.3f} ({ov*100:.1f}%)")
+    log(f, f"类别映射         : 0={CLASS_NAMES[0]}  1={CLASS_NAMES[1]}  2={CLASS_NAMES[2]}")
     log(f, f"最大训练轮数     : {num_epochs}")
     log(f, f"Batch size       : {batch_size}")
     log(f, f"学习率           : {lr}")
@@ -619,6 +679,7 @@ def main():
         k = args.kfold
         log(f, "训练池内交叉验证（稳定性检查）")
         log(f, f"  折数 k = {k}")
+        log(f, f"  临时 checkpoint 目录: {ckpt_tmp_dir}")
         pool = sorted(list(train_pool_subjects))
         folds = [[] for _ in range(k)]
         for idx, sid in enumerate(pool):
@@ -633,7 +694,7 @@ def main():
             log(f, f"    验证受试者: {val_subjects}")
 
             # kfold 临时 checkpoint 文件名包含折序号，方便排查
-            ckpt_tmp = os.path.join(ckpt_dir, f"{exp_id}_kfold_fold{i+1}_tmp.pt")
+            ckpt_tmp = os.path.join(ckpt_tmp_dir, f"{exp_id}_kfold_fold{i+1}_tmp.pt")
             train_one_model(train_subjects, val_subjects, ckpt_tmp, use_early_stop=True)
 
         log(f, "")
@@ -643,29 +704,15 @@ def main():
     # 最终训练，每个窗口大小只训练一个 baseline checkpoint
     log(f, "开始最终训练（使用训练池全部受试者）")
     final_ckpt_path = os.path.join(ckpt_dir, f"{exp_id}_final_baseline_cnn.pt")
+    log(f, f"最终 checkpoint 路径: {final_ckpt_path}")
     train_one_model(train_pool_subjects, val_subjects=None, ckpt_path=final_ckpt_path, use_early_stop=False)
 
-    # 在最终测试集上评估
+    # 说明
+    # 本脚本仅负责训练并保存 baseline checkpoint。
+    # 最终测试集评估与 CSV 输出在单独脚本中完成，避免训练阶段混入任何推理与评测逻辑。
     log(f, "")
-    log(f, "开始在最终测试集上评估")
-    state = torch.load(final_ckpt_path, map_location="cpu")
-    model = CNNBaseline(in_channels=8, num_classes=3)
-    model.load_state_dict(state["model_state"])
-    model.to(device)
-
-    results_final_test = evaluate_group(
-        model=model,
-        data_root=data_root,
-        subject_ids=final_test_subjects,
-        window_size=window_size,
-        step_size=step_size,
-        device=device,
-        batch_size=batch_size,
-        num_classes=3,
-    )
-    summarize_group("最终测试集评估", results_final_test, f=f)
-
-    log(f, "")
+    log(f, "训练完成，本次运行不执行最终测试集推理。")
+    log(f, f"已保存最终 checkpoint: {final_ckpt_path}")
     log(f, "全部完成。")
     f.close()
 
