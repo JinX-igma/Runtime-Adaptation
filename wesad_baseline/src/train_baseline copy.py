@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """\
-WESAD 基线训练（固定五人最终测试集）。
+WESAD 基线训练（固定五人最终测试集，训练池内可选小折数交叉验证）。
 
 目标
 1 留出 5 个受试者作为最终部署测试集，从头到尾不参与训练和任何选择。
 2 剩余受试者作为训练池，用于训练群体 baseline。
-3 每个窗口大小只训练 1 个 baseline checkpoint 并保存。最终测试在单独脚本中完成。
+3 在训练池内可选 2 折或 3 折交叉验证，仅用于验证训练流程稳定性，不用于调参。
+4 每个窗口大小只训练 1 个 baseline checkpoint 并保存。最终测试在单独脚本中完成。
 
 说明
 step_size 固定为 window_size 的一半，对应 50% overlap，不允许手动指定。
@@ -53,6 +54,18 @@ def window_meta(window_size: int, step_size: int, fs_hz: int = FS_HZ):
     overlap = 1.0 - (float(step_size) / float(window_size))
     return w_sec, s_sec, overlap
 
+def choose_val_subjects(train_pool, preferred=(13, 14), k: int = 2):
+    """从当前训练池中选择验证受试者。
+
+    优先选择 preferred 中的 ID，如不足则补充最小的 ID。
+    保证 LOSO 完全受试者不重叠。
+    """
+    pool = [int(s) for s in train_pool]
+    val = [s for s in preferred if s in pool]
+    if len(val) < k:
+        remain = [s for s in sorted(pool) if s not in val]
+        val += remain[: max(0, k - len(val))]
+    return val[:k]
 
 # ============================================================
 # 工具函数: 随机种子, 日志, exp_id
@@ -67,16 +80,19 @@ def set_seed(seed: int = 42):
         torch.cuda.manual_seed_all(seed)
 
 
-def create_experiment_id(prefix: str = "baseline", window_size: int = None) -> str:
+def create_experiment_id(prefix: str = "baseline", window_size: int = None, kfold: int = None) -> str:
     """生成实验编号。
 
     目标是让文件名一眼可读，至少包含时间戳与关键配置。
     window_size 以样本数记录，例如 W700。
+    kfold 记录为 K0 K2 K3。
     """
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
     parts = ["exp", now]
     if window_size is not None:
         parts.append(f"W{int(window_size)}")
+    if kfold is not None:
+        parts.append(f"K{int(kfold)}")
     parts.append(prefix)
     return "_".join(parts)
 
@@ -386,6 +402,13 @@ def main():
         help="最终测试集受试者 ID，逗号分隔，例如 13,14,15,16,17。该集合从头到尾不参与训练。",
     )
     parser.add_argument(
+        "--kfold",
+        type=int,
+        default=2,
+        choices=[0, 2, 3],
+        help="训练池内交叉验证折数。0 表示不做。2 或 3 仅用于稳定性检查，不用于调参。",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cpu",
@@ -430,18 +453,22 @@ def main():
 
     w_sec, s_sec, ov = window_meta(window_size, step_size)
 
-    # exp_id 写入窗口大小配置，便于定位日志与 checkpoint
-    exp_id = create_experiment_id("baseline", window_size=window_size)
+    # exp_id 写入窗口大小与 kfold 配置，便于定位日志与 checkpoint
+    exp_id = create_experiment_id("baseline", window_size=window_size, kfold=args.kfold)
     f, log_path = create_logger(exp_id)
 
     # checkpoint 目录
     ckpt_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    # kfold 稳定性检查的临时 checkpoint 单独放在 tmp 子目录，避免污染主目录
+    ckpt_tmp_dir = os.path.join(ckpt_dir, "tmp")
+    os.makedirs(ckpt_tmp_dir, exist_ok=True)
+
     log(f, "========== 基线训练与评估 ==========")
     log(f, f"实验编号         : {exp_id}")
     log(f, f"日志路径         : {log_path}")
-    log(f, "命名规则         : exp_时间_W窗口样本_baseline")
+    log(f, "命名规则         : exp_时间_W窗口样本_K折数_baseline")
     log(f, f"设备             : {device}")
     log(f, f"数据根目录       : {data_root}")
     log(f, f"采样率           : {FS_HZ} Hz")
@@ -475,6 +502,7 @@ def main():
     log(f, "训练与评估协议")
     log(f, f"  最终测试集(5人) : {final_test_subjects}")
     log(f, f"  训练池(其余人)  : {train_pool_subjects}")
+    log(f, f"  训练池 kfold    : {args.kfold}")
     log(f, "")
 
     def train_one_model(train_subjects, val_subjects, ckpt_path, use_early_stop: bool):
@@ -646,6 +674,32 @@ def main():
 
         return ckpt_path
 
+    # 训练池内 kfold 仅用于流程稳定性检查，不用于调参
+    if args.kfold > 0:
+        k = args.kfold
+        log(f, "训练池内交叉验证（稳定性检查）")
+        log(f, f"  折数 k = {k}")
+        log(f, f"  临时 checkpoint 目录: {ckpt_tmp_dir}")
+        pool = sorted(list(train_pool_subjects))
+        folds = [[] for _ in range(k)]
+        for idx, sid in enumerate(pool):
+            folds[idx % k].append(sid)
+
+        for i in range(k):
+            val_subjects = folds[i]
+            train_subjects = [s for j in range(k) if j != i for s in folds[j]]
+            log(f, "")
+            log(f, f"  kfold 第 {i+1} 折")
+            log(f, f"    训练受试者: {train_subjects}")
+            log(f, f"    验证受试者: {val_subjects}")
+
+            # kfold 临时 checkpoint 文件名包含折序号，方便排查
+            ckpt_tmp = os.path.join(ckpt_tmp_dir, f"{exp_id}_kfold_fold{i+1}_tmp.pt")
+            train_one_model(train_subjects, val_subjects, ckpt_tmp, use_early_stop=True)
+
+        log(f, "")
+        log(f, "训练池内交叉验证完成，仅用于稳定性确认")
+        log(f, "")
 
     # 最终训练，每个窗口大小只训练一个 baseline checkpoint
     log(f, "开始最终训练（使用训练池全部受试者）")

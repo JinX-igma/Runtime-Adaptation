@@ -35,6 +35,7 @@ def main():
     p.add_argument("--data-root", type=str, required=True)
     p.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
     p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--kfold", type=int, default=2, choices=[0, 2, 3])
     p.add_argument("--python", type=str, default="python3",
                    help="python 可执行文件，例如 python3")
     p.add_argument("--script", type=str, default="train_baseline.py",
@@ -56,6 +57,7 @@ def main():
             "--device", args.device,
             "--epochs", str(args.epochs),
             "--window-size", str(ws),
+            "--kfold", str(args.kfold),
         ]
         print("\n[Runner] sec=", sec, " window_size=", ws)
         print("[Runner] cmd:", " ".join(cmd))
